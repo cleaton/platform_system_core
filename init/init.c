@@ -58,9 +58,15 @@ static int property_triggers_enabled = 0;
 static int   bootchart_count;
 #endif
 
+#ifndef BOARD_CHARGING_CMDLINE_NAME
+#define BOARD_CHARGING_CMDLINE_NAME "androidboot.battchg_pause"
+#define BOARD_CHARGING_CMDLINE_VALUE "true"
+#endif
+
 static char console[32];
 static char serialno[32];
 static char bootmode[32];
+static char battchg_pause[32];
 static char baseband[32];
 static char carrier[32];
 static char bootloader[32];
@@ -88,6 +94,8 @@ static char *console_name = "/dev/console";
 static time_t process_needs_restart;
 
 static const char *ENV[32];
+
+static unsigned charging_mode = 0;
 
 /* add_environment - add "key=value" to the current environment */
 int add_environment(const char *key, const char *val)
@@ -438,6 +446,8 @@ static void import_kernel_nv(char *name, int in_qemu)
             strlcpy(console, value, sizeof(console));
         } else if (!strcmp(name,"androidboot.mode")) {
             strlcpy(bootmode, value, sizeof(bootmode));
+        } else if (!strcmp(name,BOARD_CHARGING_CMDLINE_NAME)) {
+            strlcpy(battchg_pause, value, sizeof(battchg_pause));
         } else if (!strcmp(name,"androidboot.serialno")) {
             strlcpy(serialno, value, sizeof(serialno));
         } else if (!strcmp(name,"androidboot.baseband")) {
@@ -521,12 +531,31 @@ static int wait_for_coldboot_done_action(int nargs, char **args)
     return ret;
 }
 
+static int charging_mode_booting(void)
+{
+#ifndef BOARD_CHARGING_MODE_BOOTING_LPM
+    return 0;
+#else
+    int f;
+    char cmb;
+    f = open(BOARD_CHARGING_MODE_BOOTING_LPM, O_RDONLY);
+    if (f < 0)
+        return 0;
+
+    if (1 != read(f, (void *)&cmb,1))
+        return 0;
+
+    close(f);
+    return ('1' == cmb);
+#endif
+}
+
 static int property_init_action(int nargs, char **args)
 {
     bool load_defaults = true;
 
     INFO("property init\n");
-    if (!strcmp(bootmode, "charger"))
+    if (charging_mode)
         load_defaults = false;
     property_init(load_defaults);
     return 0;
@@ -709,15 +738,26 @@ int main(int argc, char **argv)
     klog_init();
 
     INFO("reading config file\n");
-    init_parse_config_file("/init.rc");
+
+    if (!charging_mode_booting())
+       init_parse_config_file("/init.rc");
+    else
+       init_parse_config_file("/lpm.rc");
 
     /* pull the kernel commandline and ramdisk properties file in */
     import_kernel_cmdline(0, import_kernel_nv);
     /* don't expose the raw commandline to nonpriv processes */
     chmod("/proc/cmdline", 0440);
+
     get_hardware_name(hardware, &revision);
-    snprintf(tmp, sizeof(tmp), "/init.%s.rc", hardware);
-    init_parse_config_file(tmp);
+
+    if (charging_mode_booting() || strcmp(bootmode, "charger") == 0 || strcmp(battchg_pause, BOARD_CHARGING_CMDLINE_VALUE) == 0)
+        charging_mode = 1;
+
+    if (!charging_mode_booting()) {
+         snprintf(tmp, sizeof(tmp), "/init.%s.rc", hardware);
+         init_parse_config_file(tmp);
+    }
 
     action_for_each_trigger("early-init", action_add_queue_tail);
 
@@ -731,7 +771,7 @@ int main(int argc, char **argv)
     action_for_each_trigger("init", action_add_queue_tail);
 
     /* skip mounting filesystems in charger mode */
-    if (strcmp(bootmode, "charger") != 0) {
+    if (!charging_mode_booting() && strcmp(bootmode, "charger") != 0) {
         action_for_each_trigger("early-fs", action_add_queue_tail);
         action_for_each_trigger("fs", action_add_queue_tail);
         action_for_each_trigger("post-fs", action_add_queue_tail);
@@ -742,7 +782,7 @@ int main(int argc, char **argv)
     queue_builtin_action(signal_init_action, "signal_init");
     queue_builtin_action(check_startup_action, "check_startup");
 
-    if (!strcmp(bootmode, "charger")) {
+    if (charging_mode) {
         action_for_each_trigger("charger", action_add_queue_tail);
     } else {
         action_for_each_trigger("early-boot", action_add_queue_tail);
@@ -750,7 +790,7 @@ int main(int argc, char **argv)
     }
 
         /* run all property triggers based on current state of the properties */
-    queue_builtin_action(queue_property_triggers_action, "queue_propety_triggers");
+    queue_builtin_action(queue_property_triggers_action, "queue_property_triggers");
 
 
 #if BOOTCHART
